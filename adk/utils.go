@@ -116,24 +116,35 @@ func getMessageFromWrappedEvent(e *agentEventWrapper) (Message, error) {
 		return e.AgentEvent.Output.MessageOutput.Message, nil
 	}
 
-	if e.concatenatedMessage != nil {
-		return e.concatenatedMessage, nil
-	}
-
 	if e.StreamErr != nil {
 		return nil, e.StreamErr
 	}
 
-	e.mu.Lock()
-	defer e.mu.Unlock()
 	if e.concatenatedMessage != nil {
 		return e.concatenatedMessage, nil
 	}
 
-	var (
-		msgs []Message
-		s    = e.AgentEvent.Output.MessageOutput.MessageStream
-	)
+	e.consumeStream()
+
+	if e.StreamErr != nil {
+		return nil, e.StreamErr
+	}
+	return e.concatenatedMessage, nil
+}
+
+// consumeStream drains the message stream, setting concatenatedMessage on
+// success or StreamErr on failure. The stream is always replaced with an
+// error-free, materialized version safe for gob encoding.
+func (e *agentEventWrapper) consumeStream() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.concatenatedMessage != nil {
+		return
+	}
+
+	s := e.AgentEvent.Output.MessageOutput.MessageStream
+	var msgs []Message
 
 	defer s.Close()
 	for {
@@ -148,14 +159,19 @@ func getMessageFromWrappedEvent(e *agentEventWrapper) (Message, error) {
 			// We intentionally exclude the error from the new stream to ensure gob encoding
 			// compatibility, as the stream may be consumed during serialization.
 			e.AgentEvent.Output.MessageOutput.MessageStream = schema.StreamReaderFromArray(msgs)
-			return nil, err
+			return
 		}
-
 		msgs = append(msgs, msg)
 	}
 
 	if len(msgs) == 0 {
-		return nil, errors.New("no messages in MessageVariant.MessageStream")
+		e.StreamErr = errors.New("no messages in MessageVariant.MessageStream")
+		// Defensively replace the stream. The defer s.Close() above already
+		// ensures subsequent Recv() returns io.EOF, but we replace it anyway
+		// to make the invariant explicit: after consumeStream, MessageStream
+		// is always safe for MessageVariant.GobEncode to consume.
+		e.AgentEvent.Output.MessageOutput.MessageStream = schema.StreamReaderFromArray(msgs)
+		return
 	}
 
 	if len(msgs) == 1 {
@@ -166,11 +182,11 @@ func getMessageFromWrappedEvent(e *agentEventWrapper) (Message, error) {
 		if err != nil {
 			e.StreamErr = err
 			e.AgentEvent.Output.MessageOutput.MessageStream = schema.StreamReaderFromArray(msgs)
-			return nil, err
+			return
 		}
 	}
 
-	return e.concatenatedMessage, nil
+	e.AgentEvent.Output.MessageOutput.MessageStream = schema.StreamReaderFromArray([]Message{e.concatenatedMessage})
 }
 
 // copyAgentEvent copies an AgentEvent.
